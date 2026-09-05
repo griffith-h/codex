@@ -136,7 +136,8 @@ impl Hooks {
         }
     }
 
-    /// Abort and join outstanding async hooks during session shutdown.
+    /// Abort ordinary async hooks and give built-in executor cleanup hooks a bounded opportunity
+    /// to finish during session shutdown.
     pub async fn shutdown(&self) {
         self.engine.command_runtime.shutdown().await;
     }

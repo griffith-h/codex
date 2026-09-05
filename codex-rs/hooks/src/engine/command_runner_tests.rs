@@ -22,6 +22,7 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use tempfile::tempdir;
+use tokio::sync::oneshot;
 use tokio::time::sleep;
 use tokio::time::timeout;
 
@@ -533,4 +534,21 @@ print(json.dumps({{
             .is_err(),
         "shutdown must not deliver a late async result"
     );
+}
+
+#[tokio::test]
+async fn graceful_shutdown_runs_queued_cleanup_hooks() {
+    let (runtime, _results) = runtime();
+    let (completed_tx, completed_rx) = oneshot::channel();
+
+    runtime.schedule_async_cleanup_task(async move {
+        completed_tx
+            .send(())
+            .expect("cleanup task receiver should remain open");
+    });
+
+    runtime.shutdown().await;
+    completed_rx
+        .await
+        .expect("queued cleanup hook should run during graceful shutdown");
 }

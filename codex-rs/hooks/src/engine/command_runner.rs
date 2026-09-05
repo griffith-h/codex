@@ -43,6 +43,7 @@ use codex_protocol::protocol::HookOutputEntry;
 use codex_protocol::protocol::HookOutputEntryKind;
 
 const MAX_CONCURRENT_ASYNC_HOOKS: usize = 8;
+const CLEANUP_HOOK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Owns command execution and bounded asynchronous work for one session.
 #[derive(Clone)]
@@ -57,6 +58,8 @@ pub(crate) struct CommandHookRuntime {
 struct CommandHookRuntimeState {
     concurrency_limit: Arc<Semaphore>,
     tasks: JoinSet<()>,
+    cleanup_tasks: JoinSet<()>,
+    shutting_down: bool,
 }
 
 impl Default for CommandHookRuntimeState {
@@ -64,6 +67,8 @@ impl Default for CommandHookRuntimeState {
         Self {
             concurrency_limit: Arc::new(Semaphore::new(MAX_CONCURRENT_ASYNC_HOOKS)),
             tasks: JoinSet::new(),
+            cleanup_tasks: JoinSet::new(),
+            shutting_down: false,
         }
     }
 }
@@ -161,14 +166,36 @@ impl CommandHookRuntime {
     }
 
     pub(crate) fn schedule_async_task(&self, task: impl Future<Output = ()> + Send + 'static) {
+        self.schedule_task(task, AsyncTaskClass::Ordinary);
+    }
+
+    /// Schedule an async lifecycle task that should get a short opportunity to finish during
+    /// session shutdown. Built-in executor cleanup uses this path because it owns external
+    /// processes that can outlive the Codex turn.
+    pub(crate) fn schedule_async_cleanup_task(
+        &self,
+        task: impl Future<Output = ()> + Send + 'static,
+    ) {
+        self.schedule_task(task, AsyncTaskClass::Cleanup);
+    }
+
+    fn schedule_task(
+        &self,
+        task: impl Future<Output = ()> + Send + 'static,
+        class: AsyncTaskClass,
+    ) {
         let mut state = self.lock_state();
-        if state.concurrency_limit.is_closed() {
+        if state.shutting_down {
             return;
         }
 
-        while state.tasks.try_join_next().is_some() {}
         let concurrency_limit = Arc::clone(&state.concurrency_limit);
-        state.tasks.spawn(async move {
+        let tasks = match class {
+            AsyncTaskClass::Ordinary => &mut state.tasks,
+            AsyncTaskClass::Cleanup => &mut state.cleanup_tasks,
+        };
+        while tasks.try_join_next().is_some() {}
+        tasks.spawn(async move {
             let Ok(_permit) = concurrency_limit.acquire_owned().await else {
                 return;
             };
@@ -177,14 +204,39 @@ impl CommandHookRuntime {
     }
 
     pub(crate) async fn shutdown(&self) {
-        let mut tasks = {
+        let (mut tasks, mut cleanup_tasks, concurrency_limit) = {
             let mut state = self.lock_state();
-            state.concurrency_limit.close();
-            std::mem::take(&mut state.tasks)
+            state.shutting_down = true;
+            (
+                std::mem::take(&mut state.tasks),
+                std::mem::take(&mut state.cleanup_tasks),
+                Arc::clone(&state.concurrency_limit),
+            )
         };
+
+        // Ordinary async hooks are user work and keep the existing fast shutdown behavior.
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
+
+        // Keep the semaphore open while draining: a queued cleanup task still needs to acquire
+        // a permit before it can run.
+        let timed_out = timeout(CLEANUP_HOOK_SHUTDOWN_TIMEOUT, async {
+            while cleanup_tasks.join_next().await.is_some() {}
+        })
+        .await
+        .is_err();
+        concurrency_limit.close();
+        if timed_out {
+            cleanup_tasks.abort_all();
+            while cleanup_tasks.join_next().await.is_some() {}
+        }
     }
+}
+
+#[derive(Clone, Copy)]
+enum AsyncTaskClass {
+    Ordinary,
+    Cleanup,
 }
 
 #[tracing::instrument(
